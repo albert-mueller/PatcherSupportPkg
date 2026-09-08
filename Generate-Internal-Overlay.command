@@ -190,7 +190,9 @@ class GenerateInternalDiffDiskImage:
             # Passphrase goes over stdin, not argv: a -passphrase value is visible
             # in ps output to every other user on the machine while hdiutil runs.
             # Encryption method is stated explicitly so the following flag cannot
-            # be consumed as the method name.
+            # be consumed as the method name. No trailing newline is added:
+            # -stdinpass consumes stdin verbatim and would fold it into the
+            # passphrase.
             self._run(
                 ["/usr/bin/hdiutil", "convert",
                  "-format", "ULMO", tmp_dmg,
@@ -200,7 +202,7 @@ class GenerateInternalDiffDiskImage:
                  "-ov"
                 ],
                 "convert the disk image",
-                input=self._fetch_encryption_password() + "\n"
+                input=self._fetch_encryption_password()
             )
         finally:
             shutil.rmtree(tmp_directory, ignore_errors=True)
