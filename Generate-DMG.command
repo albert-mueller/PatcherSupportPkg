@@ -155,9 +155,9 @@ class GenerateDiskImage:
                 "-ov",
             ],
             "convert the disk image",
-            # Trailing newline terminates the passphrase read rather than
-            # relying on EOF to do it.
-            input=(self._passphrase + "\n").encode()
+            # No trailing newline: -stdinpass consumes stdin verbatim, so a
+            # newline would become part of the passphrase itself.
+            input=self._passphrase.encode()
         )
 
 
