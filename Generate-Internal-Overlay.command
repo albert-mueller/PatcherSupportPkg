@@ -8,6 +8,9 @@ Resulting DMG will be placed in the root of the OpenCore-Legacy-Patcher repo for
 """
 
 import os
+import sys
+import shutil
+import tempfile
 import subprocess
 
 from pathlib import Path
@@ -16,7 +19,13 @@ from pathlib import Path
 OCLP_DIRECTORY:  str = "../OpenCore-Legacy-Patcher"
 OVERLAY_FOLDER:  str = "DortaniaInternalResources"
 OVERLAY_DMG:     str = OVERLAY_FOLDER + ".dmg"
+OVERLAY_VOLNAME: str = "Dortania Internal Resources"
+DMG_ENCRYPTION:  str = "AES-256"
 ENCRYPTION_FILE: str = "" # Replace with path to file containing the encryption password
+
+
+class BuildError(Exception):
+    """Raised for any recoverable failure, reported without a traceback."""
 
 
 class GenerateInternalDiffDiskImage:
@@ -40,10 +49,16 @@ class GenerateInternalDiffDiskImage:
         """
         uncommited_files = self._find_uncommited_files()
         uncommited_files = [file[1:-1] if file.startswith(("'", '"')) and file.endswith(("'", '"')) else file for file in uncommited_files]
-        uncommited_files = [file for file in uncommited_files if file.startswith("Universal-Binaries")]
+        # Trailing slash required: "Universal-Binaries" alone, or a sibling such as
+        # "Universal-Binaries-Old/", must not reach the path split in _generate_dmg.
+        uncommited_files = [file for file in uncommited_files if file.startswith("Universal-Binaries/")]
 
         for extension in [".zip", ".dmg", ".pkg"]:
             uncommited_files = [file for file in uncommited_files if not file.endswith(extension)]
+
+        # Directories are copied via their contents; a bare directory entry would
+        # nest wrongly under the overlay folder.
+        uncommited_files = [file for file in uncommited_files if not Path(file).is_dir()]
 
         return uncommited_files
 
@@ -62,8 +77,26 @@ class GenerateInternalDiffDiskImage:
             print(uncommited_files.stderr)
             return []
 
-        # Strip status flags
-        return [file[3:] for file in uncommited_files.stdout.split("\n") if file]
+        results = []
+        for line in uncommited_files.stdout.split("\n"):
+            if not line:
+                continue
+
+            index_status, worktree_status = line[0], line[1]
+
+            # Deleted files no longer exist on disk; copying them would fail.
+            if "D" in (index_status, worktree_status):
+                continue
+
+            path = line[3:]
+
+            # Renames are reported as "old -> new"; only the new path exists.
+            if "R" in (index_status, worktree_status) and " -> " in path:
+                path = path.split(" -> ", 1)[1]
+
+            results.append(path)
+
+        return results
 
 
     def _legacy_find_uncommited_files(self) -> list:
@@ -82,7 +115,7 @@ class GenerateInternalDiffDiskImage:
             print(uncommited_files.stderr)
             return []
 
-        return uncommited_files.stdout.split("\n")
+        return [file for file in uncommited_files.stdout.split("\n") if file]
 
 
     def _prepare_workspace(self) -> None:
@@ -104,10 +137,25 @@ class GenerateInternalDiffDiskImage:
         """
         Return the encryption password for the DMG
         """
+        if not ENCRYPTION_FILE:
+            return "password"
         password_file = Path(ENCRYPTION_FILE).expanduser()
         if not password_file.exists() or not password_file.is_file():
             return "password"
         return password_file.read_text().strip()
+
+
+    def _run(self, arguments: list, description: str, **kwargs) -> None:
+        """
+        Run a command and surface its failure instead of silently continuing
+        """
+        result = subprocess.run(arguments, capture_output=True, text=True, **kwargs)
+        if result.returncode != 0:
+            for stream in (result.stdout, result.stderr):
+                for line in (stream or "").splitlines():
+                    if line.strip():
+                        print(f"      {line}")
+            raise BuildError(f"Failed to {description} (exit {result.returncode})")
 
 
     def _generate_dmg(self, files: list) -> None:
@@ -118,30 +166,46 @@ class GenerateInternalDiffDiskImage:
         for file in files:
             print(f"    - {file}")
             src_path = Path(file)
-            dst_path = Path(OVERLAY_FOLDER) / str(src_path).split("Universal-Binaries/")[1]
+            dst_path = Path(OVERLAY_FOLDER) / str(src_path).split("Universal-Binaries/", 1)[1]
             if not Path(dst_path.parent).exists():
                 subprocess.run(["/bin/mkdir", "-p", dst_path.parent])
             subprocess.run(["/bin/cp", "-a", src_path, dst_path])
 
-        print("  - Generating tmp DMG")
-        subprocess.run([
-            "/usr/bin/hdiutil", "create",
-            "-srcfolder", OVERLAY_FOLDER, "tmp.dmg",
-            "-volname", "Dortania Internal Resources",
-            "-fs", "APFS",
-            "-ov",
-            "-format", "UDRO"
-        ], capture_output=True, text=True)
-        print("  - Converting to encrypted DMG")
-        subprocess.run(
-            ["/usr/bin/hdiutil", "convert",
-             "-format", "ULMO", "tmp.dmg",
-             "-o", OVERLAY_DMG,
-             "-passphrase", self._fetch_encryption_password(),
-             "-encryption",
-             "-ov"
-        ], capture_output=True, text=True)
-        subprocess.run(["/bin/rm", "tmp.dmg"])
+        # Temporary image lives outside the repo so a failed run cannot strand it.
+        tmp_directory = tempfile.mkdtemp(prefix="psp-overlay-")
+        tmp_dmg       = os.path.join(tmp_directory, "tmp.dmg")
+
+        try:
+            print("  - Generating tmp DMG")
+            self._run([
+                "/usr/bin/hdiutil", "create",
+                "-srcfolder", OVERLAY_FOLDER, tmp_dmg,
+                "-volname", OVERLAY_VOLNAME,
+                "-fs", "APFS",
+                "-ov",
+                "-format", "UDRO"
+            ], "create the temporary disk image")
+
+            print("  - Converting to encrypted DMG")
+            # Passphrase goes over stdin, not argv: a -passphrase value is visible
+            # in ps output to every other user on the machine while hdiutil runs.
+            # Encryption method is stated explicitly so the following flag cannot
+            # be consumed as the method name. No trailing newline is added:
+            # -stdinpass consumes stdin verbatim and would fold it into the
+            # passphrase.
+            self._run(
+                ["/usr/bin/hdiutil", "convert",
+                 "-format", "ULMO", tmp_dmg,
+                 "-o", OVERLAY_DMG,
+                 "-encryption", DMG_ENCRYPTION,
+                 "-stdinpass",
+                 "-ov"
+                ],
+                "convert the disk image",
+                input=self._fetch_encryption_password()
+            )
+        finally:
+            shutil.rmtree(tmp_directory, ignore_errors=True)
 
         if Path(OCLP_DIRECTORY).exists():
             print("  - Moving DMG")
@@ -154,4 +218,8 @@ class GenerateInternalDiffDiskImage:
 
 
 if __name__ == "__main__":
-    GenerateInternalDiffDiskImage()
+    try:
+        GenerateInternalDiffDiskImage()
+    except BuildError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -13,6 +13,8 @@ A repository dedicated to Apple binaries used for patching macOS to run on legac
 
 Special thanks to the following developers and projects:
 
+* ••[Medelcartelinc](https://github.com/Medelcartelinc)
+  * for adding support for Intel Broadwell, Skylake, Haswell, AMD GCN 1-3 for macOS 26 Tahoe
 * **[ASentientBot](https://github.com/ASentientBot)**
   * Mojave, Catalina, and Big Sur graphics acceleration patches.
 * **[dosdude1](https://github.com/dosdude1)**
